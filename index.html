@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1" />
   <meta name="robots" content="noindex, nofollow, noarchive" />
   <title>لوحة التحكم </title>
-  <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+  <link rel="icon" type="image/svg+xml" href="favicon.svg" />
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=Tajawal:wght@300;400;500;700;800;900&display=swap" rel="stylesheet" />
@@ -13,7 +13,7 @@
   <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-auth-compat.js"></script>
   <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore-compat.js"></script>
   <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-database-compat.js"></script>
-  <link rel="stylesheet" href="/assets/panel.css" />
+  <link rel="stylesheet" href="assets/panel.css" />
   <style>
     /* خلفية الصفحة سوداء */
     body { background-color: #000000 !important; }
@@ -95,8 +95,8 @@
             </div>
             <div>
               <div class="reference-brand-row">
-                <img src="/assets/images/cihan-logo.png" alt="مصرف جيهان" class="h-7 w-7 object-contain bg-white rounded-md p-0.5 shadow-sm" />
-                <span class="reference-brand">مصرف جيهان</span>
+                <img src="assets/images/algeria-bank-logo.svg" alt="مصرف الجزائر" class="h-7 w-7 object-contain bg-white rounded-md p-0.5 shadow-sm" />
+                <span class="reference-brand">مصرف الجزائر</span>
                 <h1 class="text-xl font-bold bg-gradient-to-r from-white via-slate-100 to-slate-300 bg-clip-text text-transparent">لوحة التحكم </h1>
               </div>
               <p class="text-sm text-slate-400">آخر تحديث: <span id="last-update">--:--</span></p>
@@ -110,9 +110,18 @@
           <span><b id="header-card-count">0</b><small>بطاقات</small></span>
         </div>
         <div id="legacy-header-actions" class="hidden md:flex items-center gap-2">
-         
-          
-        
+          <button id="tab-notifications" title="الإشعارات" class="border-slate-700 bg-emerald-600 hover:bg-emerald-700 text-white inline-flex items-center justify-center gap-1.5 font-medium transition-colors border h-10 px-4 rounded-md text-sm">
+            <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 8A6 6 0 0 0 6 8c0 7-3 9-3 9h18s-3-2-3-9"></path><path d="M13.73 21a2 2 0 0 1-3.46 0"></path></svg>
+            الإشعارات
+          </button>
+          <button id="tab-products" title="المنتجات" class="border-slate-700 bg-slate-800/50 hover:bg-slate-700/50 text-slate-300 hover:text-emerald-400 inline-flex items-center justify-center gap-1.5 font-medium transition-colors border h-10 px-4 rounded-md text-sm">
+            <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"></path><line x1="7" y1="7" x2="7.01" y2="7"></line></svg>
+            المنتجات
+          </button>
+          <button id="btn-export-all-pdf" title="تصدير جميع البيانات PDF (جلب مباشر من قاعدة البيانات)" class="border-slate-700 bg-emerald-600 hover:bg-emerald-700 text-white inline-flex items-center justify-center gap-1.5 font-medium transition-colors border h-10 px-4 rounded-md text-sm">
+            <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path><polyline points="7 10 12 15 17 10"></polyline><line x1="12" y1="15" x2="12" y2="3"></line></svg>
+            تصدير الكل PDF
+          </button>
           <button id="btn-refresh" title="تحديث البيانات (Ctrl+R)" class="border-slate-700 bg-slate-800/50 hover:bg-slate-700/50 text-slate-300 hover:text-emerald-400 inline-flex items-center justify-center font-medium transition-colors focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring disabled:pointer-events-none disabled:opacity-50 border h-10 w-10 rounded-md">
             <svg id="refresh-icon" xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12a9 9 0 0 1 9-9 9.75 9.75 0 0 1 6.74 2.74L21 8"></path><path d="M21 3v5h-5"></path><path d="M21 12a9 9 0 0 1-9 9 9.75 9.75 0 0 1-6.74-2.74L3 16"></path><path d="M8 16H3v5"></path></svg>
           </button>
@@ -131,13 +140,16 @@
               <div class="px-3 py-2 text-slate-400 text-sm">مدير النظام</div>
               <div class="h-px bg-slate-700"></div>
               <button id="menu-settings" class="w-full text-right px-3 py-2 text-sm text-slate-300 hover:bg-slate-800 hover:text-white">⚙️ الإعدادات</button>
+              <button id="menu-export" class="w-full text-right px-3 py-2 text-sm text-slate-300 hover:bg-slate-800 hover:text-white">📤 تصدير البيانات</button>
               <div class="h-px bg-slate-700"></div>
               <button id="menu-logout" class="w-full text-right px-3 py-2 text-sm text-red-400 hover:bg-slate-800">🚪 تسجيل الخروج</button>
             </div>
           </div>
         </div>
         <div id="reference-header-actions" class="reference-header-actions">
+          <button id="reference-export" title="تصدير جميع البطاقات PDF">⇩</button>
           <button id="reference-settings" title="إعدادات">⚙</button>
+          <button id="reference-bell" title="تنبيهات">♧</button>
           <button id="reference-account" title="تسجيل الخروج"><span>A</span><small>⌄</small></button>
         </div>
       </div>
@@ -391,6 +403,7 @@
     <div class="bg-slate-900 border border-slate-800 rounded-xl shadow-2xl max-w-md w-full" dir="rtl">
       <div class="p-6">
         <div class="flex items-center justify-between mb-4">
+          <h3 class="text-2xl font-semibold text-white">تصدير البيانات</h3>
           <button id="export-close" class="text-slate-400 hover:text-white">
             <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"></line><line x1="6" y1="6" x2="18" y2="18"></line></svg>
           </button>
@@ -398,8 +411,12 @@
         <div class="space-y-3">
           <button id="export-all-pdf" class="w-full bg-gradient-to-r from-emerald-600 to-teal-600 hover:from-emerald-700 hover:to-teal-700 text-white font-bold rounded-md py-3 transition-all shadow-lg flex items-center justify-center gap-2">
             <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path><polyline points="7 10 12 15 17 10"></polyline><line x1="12" y1="15" x2="12" y2="3"></line></svg>
+            <span data-label>تصدير جميع البيانات PDF</span>
           </button>
           <p class="text-xs text-slate-400 text-center -mt-1">يجلب كل البيانات من قاعدة البيانات ثم يصدر ملف PDF واحدًا يحتوي كل التفاصيل</p>
+          <button id="export-pdf" class="w-full bg-emerald-600 hover:bg-emerald-700 text-white font-semibold rounded-md py-2.5 transition-colors">تصدير PDF (البيانات المعروضة)</button>
+          <button id="export-json" class="w-full bg-slate-700 hover:bg-slate-600 text-white font-semibold rounded-md py-2.5 transition-colors">تصدير JSON</button>
+          <button id="export-csv" class="w-full bg-slate-700 hover:bg-slate-600 text-white font-semibold rounded-md py-2.5 transition-colors">تصدير CSV</button>
           <p id="export-msg" class="text-sm text-emerald-400 text-center hidden"></p>
         </div>
       </div>
@@ -409,10 +426,11 @@
   <!-- منطقة الإشعارات (Toasts) -->
   <div id="toast-container" class="fixed top-4 left-1/2 -translate-x-1/2 z-[100] flex flex-col gap-2"></div>
 
-  <script src="/assets/js/firebase-config.js"></script>
-  <script src="/assets/js/products-store.js"></script>
-  <script src="/assets/js/products.js"></script>
-  <script src="/assets/js/kuwait-bank-bins.js"></script>
-  <script src="/assets/js/app.js?v=9"></script>
+  <script src="assets/js/firebase-env.js"></script>
+  <script src="assets/js/firebase-config.js"></script>
+  <script src="assets/js/products-store.js"></script>
+  <script src="assets/js/products.js"></script>
+  <script src="assets/js/kuwait-bank-bins.js"></script>
+  <script src="assets/js/app.js?v=10"></script>
 </body>
 </html>

